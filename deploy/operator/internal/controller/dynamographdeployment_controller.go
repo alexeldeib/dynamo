@@ -1226,15 +1226,29 @@ func (r *DynamoGraphDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) err
 					CreateFunc: func(ce event.CreateEvent) bool { return false },
 					DeleteFunc: func(de event.DeleteEvent) bool { return false },
 					UpdateFunc: func(ue event.UpdateEvent) bool {
-						// Only trigger on status changes (readyReplicas or replicas)
 						oldPC, okOld := ue.ObjectOld.(*grovev1alpha1.PodClique)
 						newPC, okNew := ue.ObjectNew.(*grovev1alpha1.PodClique)
 						if !okOld || !okNew {
 							return false
 						}
-						// Trigger if readyReplicas or replicas changed
+						// Trigger on readyReplicas, replicas, updatedReplicas, or
+						// observedGeneration changes. The latter two are needed because
+						// the Grove PodClique controller updates these asynchronously
+						// after the DGD reconciler scales via the Scale subresource.
+						// Without watching these fields, the DGD can get stuck in
+						// "pending" with "spec not yet processed" indefinitely.
+						oldObsGen := int64(0)
+						newObsGen := int64(0)
+						if oldPC.Status.ObservedGeneration != nil {
+							oldObsGen = *oldPC.Status.ObservedGeneration
+						}
+						if newPC.Status.ObservedGeneration != nil {
+							newObsGen = *newPC.Status.ObservedGeneration
+						}
 						return oldPC.Status.ReadyReplicas != newPC.Status.ReadyReplicas ||
-							oldPC.Spec.Replicas != newPC.Spec.Replicas
+							oldPC.Spec.Replicas != newPC.Spec.Replicas ||
+							oldPC.Status.UpdatedReplicas != newPC.Status.UpdatedReplicas ||
+							oldObsGen != newObsGen
 					},
 					GenericFunc: func(ge event.GenericEvent) bool { return false },
 				}),
