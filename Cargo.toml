@@ -4,7 +4,7 @@
 [patch.crates-io]
 # Review pin until the companion tokenizer fix is published. All consuming Cargo roots
 # must use the same source, including transitive renderer/parser dependencies.
-dynamo-tokenizers = { git = "https://github.com/alexeldeib/frontend-crates.git", rev = "bcf3ebc7bb5d065f004e7f7a3b0c546b28cf80b7" }
+dynamo-tokenizers = { git = "https://github.com/alexeldeib/frontend-crates.git", rev = "3d6be16959d4710ed24fb81e04eace132aefa025" }
 
 [workspace]
 members = [
@@ -68,7 +68,7 @@ aisimulate-core = { version = "=0.13.0-dev.202609300000000061" }
 dynamo-runtime = { path = "lib/runtime", version = "1.6.0" }
 dynamo-llm = { path = "lib/llm", version = "1.6.0" }
 dynamo-rl = { path = "lib/rl", version = "1.6.0" }
-dynamo-tokenizers = { version = "=1.9.1" }
+dynamo-tokenizers = { version = "=1.9.2" }
 dynamo-renderer = { version = "=5.4.0" }
 dynamo-tokens = { path = "lib/tokens", version = "1.6.0" }
 dynamo-truthy = { path = "lib/truthy", version = "1.6.0" }
