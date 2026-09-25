@@ -3686,7 +3686,13 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 "token_ids": [],
             }
             return
-        has_mm_data = request.get("multi_modal_data") is not None
+        extra_args = request.get("extra_args") or {}
+        has_mm_input = (
+            request.get("multi_modal_data") is not None
+            or request.get("multi_modal_uuids") is not None
+            or extra_args.get("mm_kwargs_shm") is not None
+            or extra_args.get("mm_kwargs_nixl") is not None
+        )
         assembled_prompt: EmbedsPrompt | TokensPrompt | None = None
 
         if has_external_encoder_result:
@@ -3699,7 +3705,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         elif (
             mode == DisaggregationMode.AGGREGATED
             and self._custom_encoder is not None
-            and has_mm_data
+            and has_mm_input
         ):
             # A configured CustomEncoder owns the aggregated image path. Bypass
             # raw-media loading and let its decoder-selected adapter prepare the
@@ -3711,6 +3717,12 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 request,
                 request_id,
             )
+            if assembled_prompt is None:
+                # Ordinary transferred tensors cannot replace the configured
+                # encoder/adapter's image representation.
+                raise MissingMultimodalHandoffError(
+                    "Custom image encoder requires raw media input"
+                )
             multi_modal_data = None
             mm_processor_kwargs = None
             pre_rendered = None

@@ -773,7 +773,7 @@ class TestDecodeWorkerMultimodalBranching:
         """Aggregated mode delegates media loading to the shared processor."""
         handler = _make_decode_handler(disaggregation_mode="AGGREGATED")
         handler._multimodal_request_processor.extract_multimodal_data = AsyncMock(
-            return_value=None
+            return_value={"image": object()}
         )
 
         # Raise from _build_prompt_from_request so generation stops before the
@@ -797,6 +797,86 @@ class TestDecodeWorkerMultimodalBranching:
 
         handler._multimodal_request_processor.extract_multimodal_data.assert_awaited_once()
 
+    @pytest.mark.parametrize("transport", ["mm_kwargs_shm", "mm_kwargs_nixl"])
+    async def test_custom_encoder_rejects_transfer_without_raw_media(self, transport):
+        handler = _make_decode_handler(disaggregation_mode="AGGREGATED")
+        handler._custom_encoder = SimpleNamespace(encode=AsyncMock())
+        handler._custom_encoder_adapter = MagicMock()
+        handler._multimodal_request_processor.prepare_input = AsyncMock()
+        request = {
+            "token_ids": [1, 2],
+            "extra_args": {transport: {"modality": "image"}},
+        }
+
+        with pytest.raises(
+            mod.MissingMultimodalHandoffError, match="requires raw media input"
+        ):
+            async for _ in handler._generate_token_mode(request, MagicMock(), "req-1"):
+                pass
+
+        handler._custom_encoder.encode.assert_not_awaited()
+        handler._custom_encoder_adapter.prepare_prompt.assert_not_called()
+        handler._multimodal_request_processor.prepare_input.assert_not_awaited()
+
+    async def test_custom_encoder_remains_authoritative_with_transfer_metadata(self):
+        handler = _make_decode_handler(disaggregation_mode="AGGREGATED")
+        artifacts = [object()]
+        custom_prompt = {"prompt_token_ids": [1, 99, 2]}
+        handler._custom_encoder = SimpleNamespace(
+            encode=AsyncMock(return_value=artifacts)
+        )
+        handler._custom_encoder_adapter = SimpleNamespace(
+            prepare_prompt=MagicMock(return_value=custom_prompt)
+        )
+        handler._multimodal_request_processor.prepare_input = AsyncMock()
+        request = _make_raw_frontend_request(["https://example.com/image.png"])
+        request["extra_args"] = {"mm_kwargs_shm": {"modality": "image"}}
+
+        with (
+            patch.object(
+                mod, "_apply_nvext_cache_salt", side_effect=RuntimeError("test stop")
+            ) as apply_cache_salt,
+            pytest.raises(RuntimeError, match="test stop"),
+        ):
+            async for _ in handler._generate_token_mode(request, MagicMock(), "req-1"):
+                pass
+
+        handler._custom_encoder.encode.assert_awaited_once_with(
+            ["https://example.com/image.png"]
+        )
+        handler._custom_encoder_adapter.prepare_prompt.assert_called_once_with(
+            request["token_ids"], artifacts
+        )
+        handler._multimodal_request_processor.prepare_input.assert_not_awaited()
+        apply_cache_salt.assert_called_once_with(request, custom_prompt)
+
+    async def test_external_encoder_result_keeps_its_own_handoff_path(self):
+        handler = _make_decode_handler(disaggregation_mode="AGGREGATED")
+        handler._custom_encoder = object()
+        external_prompt = {"prompt_token_ids": [1, 99, 2]}
+        handler._assemble_external_encoder_prompt = AsyncMock(
+            return_value=external_prompt
+        )
+        handler._assemble_custom_encoder_prompt = AsyncMock()
+        handler._multimodal_request_processor.prepare_input = AsyncMock()
+        request = {"token_ids": [1, 2], "encoder_result": {"test": "handoff"}}
+
+        with (
+            patch.object(
+                mod, "_apply_nvext_cache_salt", side_effect=RuntimeError("test stop")
+            ) as apply_cache_salt,
+            pytest.raises(RuntimeError, match="test stop"),
+        ):
+            async for _ in handler._generate_token_mode(request, MagicMock(), "req-1"):
+                pass
+
+        handler._assemble_external_encoder_prompt.assert_awaited_once_with(
+            request, "req-1"
+        )
+        handler._assemble_custom_encoder_prompt.assert_not_awaited()
+        handler._multimodal_request_processor.prepare_input.assert_not_awaited()
+        apply_cache_salt.assert_called_once_with(request, external_prompt)
+
     async def test_decode_only_bypass_annotation_runs_as_agg(self):
         """Decode worker with conditional-disagg bypass annotation runs as AGG."""
         handler = _make_decode_handler(
@@ -804,7 +884,7 @@ class TestDecodeWorkerMultimodalBranching:
             disaggregation_mode="DECODE",
         )
         handler._multimodal_request_processor.extract_multimodal_data = AsyncMock(
-            return_value=None
+            return_value={"image": object()}
         )
         handler._build_prompt_from_request = MagicMock(
             side_effect=RuntimeError("test stop")

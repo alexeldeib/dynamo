@@ -916,6 +916,26 @@ class VllmMultimodalRequestProcessor:
                 mm_processor_kwargs,
             )
 
+        # Decode has its own model-specific KV/embedding handoff policy above.
+        # Aggregated and prefill must not silently submit a text-only prompt
+        # when a known multimodal transfer has failed without a fallback.
+        extra_args = request.get("extra_args") or {}
+        has_mm_input = (
+            request.get("multi_modal_data") is not None
+            or request.get("multi_modal_uuids") is not None
+            or extra_args.get("mm_kwargs_shm") is not None
+            or extra_args.get("mm_kwargs_nixl") is not None
+        )
+        if (
+            mode != DisaggregationMode.DECODE
+            and has_mm_input
+            and pre_rendered is None
+            and not multi_modal_data
+        ):
+            raise MissingMultimodalHandoffError(
+                "Multimodal request has no usable tensor input and no raw media fallback"
+            )
+
         return PreparedMultimodalInput(
             request=request_for_prompt,
             multi_modal_data=multi_modal_data,

@@ -1290,6 +1290,97 @@ async def test_generator_rejects_logprobs_including_zero_top_logprobs(
 
 
 @pytest.mark.asyncio
+@pytest.mark.multimodal
+@pytest.mark.parametrize("transport", ["mm_kwargs_shm", "mm_kwargs_nixl"])
+@pytest.mark.parametrize("transfer_prepared", [False, True])
+async def test_generator_retains_raw_media_after_transfer_preparation(
+    vllm_processor_module, monkeypatch, transport, transfer_prepared
+):
+    class RequestForSampling(SimpleNamespace):
+        model_fields = frozenset()
+
+    monkeypatch.setattr(
+        vllm_processor_module,
+        "preprocess_chat_request",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                request_for_sampling=RequestForSampling(
+                    max_completion_tokens=None,
+                    max_tokens=1,
+                    logprobs=None,
+                    top_logprobs=None,
+                    cache_salt=None,
+                    mm_processor_kwargs=None,
+                ),
+                tool_parser=None,
+                chat_template_kwargs={},
+                engine_prompt={"prompt": "Describe the image"},
+                prompt_token_ids=[1],
+                guided_decoding=None,
+                uses_dynamo_json_tool_call_fallback=False,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_processor_module.InputProcessor, "assign_request_id", lambda request: None
+    )
+
+    def process_inputs(request_id, engine_inputs, sampling_params, supported_tasks):
+        return SimpleNamespace(
+            sampling_params=sampling_params,
+            mm_features=[SimpleNamespace(data=object())],
+        )
+
+    processor = vllm_processor_module.VllmProcessor(
+        tokenizer=SimpleNamespace(eos_token_id=2, all_special_tokens=[]),
+        input_processor=SimpleNamespace(
+            generation_config_fields={},
+            renderer=SimpleNamespace(
+                process_for_engine_async=AsyncMock(return_value={})
+            ),
+            process_inputs=process_inputs,
+            model_config=None,
+        ),
+        output_processor=object(),
+        tool_parser_class=None,
+        reasoning_parser_class=None,
+        routed_engine=object(),
+    )
+    descriptor = {"modality": "image"}
+
+    async def prepare_transfer(vllm_preproc, dynamo_preproc, **kwargs):
+        dynamo_preproc["extra_args"] = {transport: descriptor}
+        return None, [], transfer_prepared
+
+    async def capture_request(request_id, request, dynamo_preproc, *args, **kwargs):
+        yield dynamo_preproc
+
+    monkeypatch.setattr(processor, "_prepare_mm_routing", prepare_transfer)
+    monkeypatch.setattr(processor, "_generate_and_stream", capture_request)
+    image_url = "https://example.com/image.png"
+    requests = [
+        item
+        async for item in processor._generator_inner(
+            {
+                "model": "test",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": image_url}}
+                        ],
+                    }
+                ],
+            }
+        )
+    ]
+
+    assert len(requests) == 1
+    assert requests[0]["multi_modal_data"] == {"image_url": [{"Url": image_url}]}
+    assert requests[0]["extra_args"][transport] is descriptor
+
+
+@pytest.mark.asyncio
 async def test_include_reasoning_false_keeps_response_parser_active(
     vllm_processor_module,
     monkeypatch,

@@ -4,6 +4,7 @@
 import base64
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
 
 import numpy as np
 import pytest
@@ -964,6 +965,122 @@ def test_build_tokens_prompt_omits_absent_processor_kwargs():
     )
 
     assert "mm_processor_kwargs" not in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode", [DisaggregationMode.AGGREGATED, DisaggregationMode.PREFILL]
+)
+@pytest.mark.parametrize(
+    "media_marker",
+    [
+        {"multi_modal_data": {}},
+        {"multi_modal_uuids": {}},
+        {"extra_args": {"mm_kwargs_shm": {}}},
+        {"extra_args": {"mm_kwargs_nixl": {}}},
+        {"extra_args": {"mm_kwargs_shm": {"modality": "image"}}},
+        {"extra_args": {"mm_kwargs_nixl": {"modality": "image"}}},
+    ],
+    ids=[
+        "empty-media",
+        "empty-uuids",
+        "empty-shm",
+        "empty-nixl",
+        "invalid-shm",
+        "invalid-nixl",
+    ],
+)
+async def test_missing_multimodal_input_does_not_become_text(mode, media_marker):
+    processor = _processor()
+
+    with pytest.raises(
+        mod.MissingMultimodalHandoffError, match="no raw media fallback"
+    ):
+        await processor.prepare_input(
+            {"token_ids": [1, 2], **media_marker}, "missing-media", None, mode
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_raw_media", [False, True])
+async def test_missing_shm_segment_requires_raw_fallback(has_raw_media, caplog):
+    processor = _processor()
+    image = Image.new("RGB", (1, 1))
+    processor.image_loader.load_image_batch.return_value = [image]
+    request = {
+        "token_ids": [1, 2],
+        "extra_args": {
+            "mm_kwargs_shm": {
+                "modality": "image",
+                "items": [{"name": f"mm_{uuid4().hex[:20]}", "size": 1}],
+                "mm_hashes": ["image-hash"],
+            },
+            "mm_placeholders": [{"offset": 1, "length": 1}],
+            "expanded_token_ids": [1, 99, 2],
+        },
+    }
+    if has_raw_media:
+        request["multi_modal_data"] = {
+            "image_url": [{"Url": "https://example.com/image.png"}]
+        }
+        prepared = await processor.prepare_input(
+            request, "missing-shm", None, DisaggregationMode.AGGREGATED
+        )
+        assert prepared.multi_modal_data == {"image": image}
+        assert prepared.pre_rendered_prompt is None
+        processor.image_loader.load_image_batch.assert_awaited_once()
+    else:
+        with pytest.raises(
+            mod.MissingMultimodalHandoffError, match="no raw media fallback"
+        ):
+            await processor.prepare_input(
+                request, "missing-shm", None, DisaggregationMode.AGGREGATED
+            )
+        processor.image_loader.load_image_batch.assert_not_awaited()
+
+    assert any(
+        record.exc_info and isinstance(record.exc_info[1], FileNotFoundError)
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode", [DisaggregationMode.AGGREGATED, DisaggregationMode.PREFILL]
+)
+async def test_text_only_input_needs_no_multimodal_fallback(mode):
+    prepared = await _processor().prepare_input(
+        {"token_ids": [1, 2]}, "text-only", None, mode
+    )
+
+    assert prepared.request["token_ids"] == [1, 2]
+    assert prepared.multi_modal_data is None
+    assert prepared.pre_rendered_prompt is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode", [DisaggregationMode.AGGREGATED, DisaggregationMode.PREFILL]
+)
+@pytest.mark.parametrize("unified_vision_chunk", [False, True])
+async def test_uuid_only_input_keeps_worker_cache_lookup(mode, unified_vision_chunk):
+    processor = _processor(unified_vision_chunk=unified_vision_chunk)
+    processor.image_loader.load_image_batch.return_value = [None]
+    prepared = await _prepare_prompt(
+        processor,
+        {
+            "token_ids": [1, 2],
+            "multi_modal_data": {"image_url": [{"UuidOnly": "cached-image"}]},
+            "multi_modal_uuids": {"image_url": ["cached-image"]},
+        },
+        "uuid-only",
+        None,
+        mode,
+    )
+
+    modality = "vision_chunk" if unified_vision_chunk else "image"
+    assert prepared.prompt["multi_modal_data"] == {modality: [None]}
+    assert prepared.prompt["multi_modal_uuids"] == {modality: ["cached-image"]}
 
 
 @pytest.mark.asyncio

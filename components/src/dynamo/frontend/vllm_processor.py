@@ -813,27 +813,19 @@ class VllmProcessor:
             (
                 mm_routing_info,
                 cleanup_items,
-                nixl_transferred,
+                _transferred,
             ) = await self._prepare_mm_routing(
                 vllm_preproc,
                 dynamo_preproc,
                 mm_processor_kwargs=request_for_sampling.mm_processor_kwargs,
             )
 
-            # Forward multimodal URLs so the backend handler can load the media.
-            # Only skip when ALL features were transferred — a partial transfer
-            # (some features had data=None due to processor cache) still needs
-            # URLs for the backend to process the missing features.
-            n_features = (
-                len(vllm_preproc.mm_features) if vllm_preproc.mm_features else 0
-            )
-            n_with_data = sum(
-                1 for f in (vllm_preproc.mm_features or []) if f.data is not None
-            )
-            all_transferred = nixl_transferred and n_with_data == n_features
-            if not all_transferred:
-                if mm_data:
-                    dynamo_preproc["multi_modal_data"] = mm_data
+            # Sender preparation does not guarantee that the selected worker
+            # can receive the tensors (SHM is node-local). Keep raw media for
+            # the worker's existing fallback; successful transfers still take
+            # precedence over media loading.
+            if mm_data:
+                dynamo_preproc["multi_modal_data"] = mm_data
 
             # Forward mm_processor_kwargs (e.g. use_audio_in_video) to the backend.
             if request_for_sampling.mm_processor_kwargs is not None:
