@@ -22,6 +22,7 @@ const ETA: u32 = 13;
 const THETA: u32 = 14;
 const OH: u32 = 15;
 const OTHER: u32 = 16;
+const UNICODE: u32 = 17;
 
 // Single-character tokens used to build a long, self-similar (periodic) run for the
 // prefix-matching regression test below.
@@ -56,6 +57,7 @@ impl tokenizer_traits::Decoder for TestTokenizer {
                 THETA => Some(" theta"),
                 OH => Some("o"),
                 OTHER => Some("there"),
+                UNICODE => Some("世界"),
                 A => Some("a"),
                 B => Some("b"),
                 _ => Some("?"),
@@ -84,6 +86,38 @@ fn make_decoder(
         ..Default::default()
     };
     Decoder::new(decode_stream, stop_conditions, include_stop_str, None, None)
+}
+
+#[test]
+fn earliest_stop_match_is_independent_of_list_order() {
+    for (tokens, stops, expected, matched) in [
+        (vec![THERE], vec!["re", "he"], "t", "he"),
+        (vec![THERE], vec!["he", "re"], "t", "he"),
+        (vec![UNICODE], vec!["界", "世"], "", "世"),
+        (vec![UNICODE], vec!["世", "界"], "", "世"),
+        (vec![OH, OTHER], vec!["re", "oth"], "", "oth"),
+        (vec![OH, OTHER], vec!["oth", "re"], "", "oth"),
+        // Equal-position matches retain configured-order precedence.
+        (vec![THERE], vec!["her", "he"], "t", "her"),
+        (vec![THERE], vec!["he", "her"], "t", "he"),
+    ] {
+        for include in [false, true] {
+            let mut decoder = make_decoder(None, None, None, Some(stops.clone()), include);
+            let result = decoder.process_token_ids(&tokens).unwrap();
+            let expected = format!("{expected}{}", if include { matched } else { "" });
+            assert_eq!(
+                result.text.unwrap_or_default(),
+                expected,
+                "{stops:?}, include={include}"
+            );
+            let reported = match result.stop_trigger.unwrap() {
+                StopTrigger::HiddenStopSequenceDetected(seq) if !include => seq,
+                StopTrigger::VisibleStopSequenceDetected(seq) if include => seq,
+                other => panic!("unexpected stop trigger: {other:?}"),
+            };
+            assert_eq!(reported, matched);
+        }
+    }
 }
 
 #[test]
