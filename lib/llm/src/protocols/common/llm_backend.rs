@@ -156,6 +156,10 @@ pub struct BackendOutput {
     /// decoder can resume with the same pending text instead of silently dropping it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jailed_text: Option<String>,
+
+    /// Frontend-only pending detokenizer state for migration. Never sent over the wire.
+    #[serde(skip)]
+    pub decoder_state: Option<std::sync::Arc<crate::tokenizers::DecodeStreamCheckpoint>>,
 }
 
 /// The LLM engine and backnd with manage it's own state, specifically translating how a
@@ -250,6 +254,10 @@ pub struct LLMEngineOutput {
     /// decoder with it instead of silently dropping the withheld text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jailed_text: Option<String>,
+
+    /// Frontend-only pending detokenizer state for migration. Never sent over the wire.
+    #[serde(skip)]
+    pub decoder_state: Option<std::sync::Arc<crate::tokenizers::DecodeStreamCheckpoint>>,
 }
 
 impl LLMEngineOutput {
@@ -274,6 +282,7 @@ impl LLMEngineOutput {
             engine_data: None,
             routing_data: None,
             jailed_text: None,
+            decoder_state: None,
         }
     }
 
@@ -298,6 +307,7 @@ impl LLMEngineOutput {
             engine_data: None,
             routing_data: None,
             jailed_text: None,
+            decoder_state: None,
         }
     }
 
@@ -322,6 +332,7 @@ impl LLMEngineOutput {
             engine_data: None,
             routing_data: None,
             jailed_text: None,
+            decoder_state: None,
         }
     }
 
@@ -346,6 +357,7 @@ impl LLMEngineOutput {
             engine_data: None,
             routing_data: None,
             jailed_text: None,
+            decoder_state: None,
         }
     }
 
@@ -384,6 +396,7 @@ impl LLMEngineOutput {
             engine_data: None,
             routing_data: None,
             jailed_text: None,
+            decoder_state: None,
         }
     }
 }

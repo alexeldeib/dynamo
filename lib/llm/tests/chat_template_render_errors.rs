@@ -84,6 +84,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>
             engine_data: None,
             routing_data: None,
             jailed_text: None,
+            decoder_state: None,
         };
 
         Ok(ResponseStream::new(

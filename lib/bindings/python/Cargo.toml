@@ -1,6 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+[patch.crates-io]
+# Pending-byte checkpoint API; keep all consuming workspaces on the same review pin.
+dynamo-tokenizers = { git = "https://github.com/alexeldeib/frontend-crates.git", rev = "bb17c836e4ae546243d7b12ff71c67e10612845f" }
+
 [workspace]
 # empty workspace to exclude from top level workspace
 # excluded due to pyo3 extension module build issues

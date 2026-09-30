@@ -374,6 +374,7 @@ mod tests {
             encoder_result: None,
             routing_data: None,
             jailed_text: None,
+            decoder_state: None,
         }
     }
 
@@ -434,6 +435,7 @@ mod tests {
             })),
             routing_data: None,
             jailed_text: None,
+            decoder_state: None,
         }
     }
 
@@ -845,6 +847,7 @@ mod tests {
             engine_data: None, // engine didn't provide any data
             routing_data: None,
             jailed_text: None,
+            decoder_state: None,
         };
 
         let response = generator

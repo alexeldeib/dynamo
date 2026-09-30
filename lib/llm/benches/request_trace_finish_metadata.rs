@@ -117,6 +117,7 @@ fn backend_outputs(count: usize) -> Vec<BackendOutput> {
             routing_data: None,
             encoder_result: None,
             jailed_text: None,
+            decoder_state: None,
         })
         .collect()
 }

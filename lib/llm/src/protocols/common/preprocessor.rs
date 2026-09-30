@@ -434,6 +434,12 @@ pub struct PreprocessedRequest {
     #[serde(skip)]
     pub(crate) jail_seed: Option<String>,
 
+    /// Pending detokenizer suffix from the last successfully delivered chunk.
+    /// Kept in-process so migration does not reclassify un-emitted byte tokens as prompt.
+    #[builder(default)]
+    #[serde(skip)]
+    pub(crate) decoder_seed: Option<std::sync::Arc<crate::tokenizers::DecodeStreamCheckpoint>>,
+
     /// Bootstrap info for disaggregated serving
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Option::is_none")]

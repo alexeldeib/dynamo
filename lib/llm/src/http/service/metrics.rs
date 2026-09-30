@@ -4812,6 +4812,7 @@ mod tests {
                 engine_data: None,
                 routing_data: None,
                 jailed_text: None,
+                decoder_state: None,
             }
         }
 
