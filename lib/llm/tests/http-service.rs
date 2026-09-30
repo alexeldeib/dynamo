@@ -3460,6 +3460,7 @@ mod zero_top_logprobs {
                         engine_data: None,
                         routing_data: None,
                         jailed_text: None,
+                        decoder_state: None,
                     })
                     .expect("backend output conversion failed")
             })

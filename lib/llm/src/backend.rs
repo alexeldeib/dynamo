@@ -119,6 +119,7 @@ struct DecoderParams {
     // Withheld hidden-stop-sequence prefix carried over from a migrated attempt's last
     // known-good chunk (see `PreprocessedRequest::jail_seed`). `None` on a first attempt.
     jail_seed: Option<String>,
+    decoder_seed: Option<std::sync::Arc<crate::tokenizers::DecodeStreamCheckpoint>>,
     // Whether this request could still be migrated to another worker (i.e. a `RetryManager`
     // sits in front of this `Backend` and has retries configured). When `false`, no chunk
     // this Backend emits can ever be reseeded into a retry, so there is no point snapshotting
@@ -144,6 +145,7 @@ impl DecoderParams {
             tracker: request.tracker.clone(),
             n: request.sampling_options.n.unwrap_or(1) as u32,
             jail_seed: request.jail_seed.clone(),
+            decoder_seed: request.decoder_seed.clone(),
             migration_possible: request.migration_state.is_some(),
         }
     }
@@ -184,8 +186,13 @@ impl Backend {
         let n = params.n.max(1);
         let mut decoders = HashMap::with_capacity(n as usize);
         for idx in 0..n {
+            let mut decode_stream =
+                tokenizer.decode_stream(&params.prompt_token_ids, params.skip_special_tokens);
+            if let Some(checkpoint) = &params.decoder_seed {
+                decode_stream.restore_checkpoint((**checkpoint).clone());
+            }
             let decoder = Decoder::new(
-                tokenizer.decode_stream(&params.prompt_token_ids, params.skip_special_tokens),
+                decode_stream,
                 params.stop_conditions.clone(),
                 params.include_stop_str_in_output,
                 params.tracker.clone(),
@@ -365,6 +372,7 @@ impl
                                 && let Some(data) = &mut output.data
                             {
                                 data.jailed_text = decoder.peek_jailed();
+                                data.decoder_state = decoder.decode_stream.checkpoint().map(Arc::new);
                             }
                         }
                         return Some((output, state));
@@ -545,6 +553,7 @@ impl
                     // checkpoint, so there is no reason to allocate a snapshot of it.
                     if state.migration_possible {
                         data.jailed_text = decoder.peek_jailed();
+                        data.decoder_state = decoder.decode_stream.checkpoint().map(Arc::new);
                     }
 
                     output.data = Some(data);
@@ -628,6 +637,7 @@ impl
                     engine_data: data.engine_data,
                     routing_data: data.routing_data,
                     jailed_text: data.jailed_text,
+                    decoder_state: data.decoder_state,
                 })
             })
         });

@@ -45,6 +45,7 @@ pub(crate) trait HasTokenIds {
     fn token_ids(&self) -> &[TokenIdType];
     fn worker_trace_link(&self) -> Option<&crate::protocols::common::preprocessor::TraceLink>;
     fn jailed_text(&self) -> Option<&str>;
+    fn decoder_state(&self) -> Option<&std::sync::Arc<crate::tokenizers::DecodeStreamCheckpoint>>;
 }
 
 impl HasTokenIds for BackendOutput {
@@ -57,6 +58,9 @@ impl HasTokenIds for BackendOutput {
     fn jailed_text(&self) -> Option<&str> {
         self.jailed_text.as_deref()
     }
+    fn decoder_state(&self) -> Option<&std::sync::Arc<crate::tokenizers::DecodeStreamCheckpoint>> {
+        self.decoder_state.as_ref()
+    }
 }
 
 impl HasTokenIds for LLMEngineOutput {
@@ -68,6 +72,9 @@ impl HasTokenIds for LLMEngineOutput {
     }
     fn jailed_text(&self) -> Option<&str> {
         self.jailed_text.as_deref()
+    }
+    fn decoder_state(&self) -> Option<&std::sync::Arc<crate::tokenizers::DecodeStreamCheckpoint>> {
+        self.decoder_state.as_ref()
     }
 }
 
@@ -737,6 +744,9 @@ where
         // on every chunk -- `None` once the decoder resolves it one way or the other -- so
         // this always reflects the last known-good chunk's state, never a stale one.
         self.request.jail_seed = llm_engine_output.jailed_text().map(str::to_string);
+        // Replayed token IDs become prompt context, but their un-emitted bytes
+        // still belong to the response. Restore decoder state independently.
+        self.request.decoder_seed = llm_engine_output.decoder_state().cloned();
         let output_len = u32::try_from(token_ids.len()).unwrap_or(u32::MAX);
         if self.exceed_max_seq_len(output_len) {
             return;
@@ -1078,6 +1088,7 @@ mod tests {
             engine_data: None,
             routing_data: None,
             jailed_text: None,
+            decoder_state: None,
         })
     }
 
@@ -3327,5 +3338,128 @@ mod tests {
     async fn migration_hides_stop_sequence_completed_across_real_backend_retry() {
         let text = run_raw_token_migration(Some(vec!["ozzy".to_string()]), vec![1], vec![3]).await;
         assert_eq!(text, "", "the completed hidden stop must not leak any text");
+    }
+    async fn run_byte_token_migration(
+        stop: Option<Vec<String>>,
+        first_attempt_tokens: Vec<u32>,
+        retry_tokens: Vec<u32>,
+    ) -> String {
+        let expected_tokens: Vec<_> = first_attempt_tokens
+            .iter()
+            .chain(&retry_tokens)
+            .copied()
+            .collect();
+        let context_id = uuid::Uuid::new_v4().to_string();
+        let raw_engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
+            Arc::new(RawTokenMigrationEngine {
+                calls: Arc::new(AtomicU32::new(0)),
+                first_attempt_tokens,
+                retry_tokens,
+                context_id: context_id.clone(),
+            });
+        let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            Arc::new(BackendWrappedEngine {
+                backend: byte_backend(),
+                raw_engine,
+            });
+
+        let ctx = Arc::new(Controller::new(context_id.clone()));
+        let metrics = Arc::new(Metrics::new());
+        let mut retry_manager = RetryManager::build(
+            ctx,
+            BTreeMap::new(),
+            jail_request(stop),
+            next_generate,
+            1,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            metrics,
+            None,
+        )
+        .await
+        .expect("Failed to build RetryManager");
+
+        let mut text = String::new();
+        let mut delivered_tokens = Vec::new();
+        while let Some(response) = retry_manager.next().await {
+            assert!(
+                response.error.is_none(),
+                "migration must consume the worker disconnect"
+            );
+            if let Some(data) = response.data {
+                assert!(
+                    serde_json::to_value(&data)
+                        .unwrap()
+                        .get("decoder_state")
+                        .is_none()
+                );
+                delivered_tokens.extend(data.token_ids);
+                text.push_str(data.text.as_deref().unwrap_or_default());
+            }
+        }
+        assert_eq!(
+            delivered_tokens, expected_tokens,
+            "restoring text must not replay output token accounting"
+        );
+        text
+    }
+
+    fn byte_backend() -> Arc<crate::backend::Backend> {
+        let hf: tokenizers::Tokenizer = serde_json::from_value(serde_json::json!({
+            "version": "1.0", "truncation": null, "padding": null,
+            "added_tokens": [], "normalizer": null, "pre_tokenizer": null, "post_processor": null,
+            "decoder": {"type": "Sequence", "decoders": [{"type": "ByteFallback"}, {"type": "Fuse"}]},
+            "model": {"type": "BPE", "vocab": {
+                "<0x61>": 0, "<0xF5>": 1, "<0xC3>": 2, "<0xA9>": 3,
+                " hello": 4, "!": 5, "<eos>": 6}, "merges": [], "byte_fallback": true}
+        })).unwrap();
+        let tokenizer: crate::tokenizers::Tokenizer =
+            Arc::new(crate::tokenizers::HuggingFaceTokenizer::from_tokenizer(hf)).into();
+        crate::backend::Backend::from_tokenizer(tokenizer)
+    }
+    #[tokio::test]
+    async fn migration_preserves_pending_ascii_byte_run() {
+        assert_eq!(
+            run_byte_token_migration(None, vec![0], vec![4]).await,
+            "a hello"
+        );
+    }
+    #[tokio::test]
+    async fn migration_preserves_incomplete_utf8_byte_run() {
+        assert_eq!(run_byte_token_migration(None, vec![2], vec![3]).await, "é");
+    }
+    #[test]
+    fn pending_decoder_state_is_frontend_only() {
+        let backend = byte_backend();
+        let tokenizer = backend.tokenizer.as_ref().unwrap();
+        let mut stream = tokenizer.decode_stream(&[], true);
+        assert_eq!(stream.step(2).unwrap(), None);
+        let state = Arc::new(stream.checkpoint().unwrap());
+        let mut request = jail_request(None);
+        request.decoder_seed = Some(state.clone());
+        assert!(
+            serde_json::to_value(&request)
+                .unwrap()
+                .get("decoder_seed")
+                .is_none()
+        );
+        let mut output = create_mock_output(2).data.unwrap();
+        output.decoder_state = Some(state.clone());
+        assert!(
+            serde_json::to_value(&output)
+                .unwrap()
+                .get("decoder_state")
+                .is_none()
+        );
+        let engine_output = LLMEngineOutput {
+            decoder_state: Some(state),
+            ..Default::default()
+        };
+        assert!(
+            serde_json::to_value(&engine_output)
+                .unwrap()
+                .get("decoder_state")
+                .is_none()
+        );
     }
 }

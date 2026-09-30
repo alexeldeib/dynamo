@@ -142,6 +142,7 @@ fn build_backend_output(text: &str) -> BackendOutput {
         engine_data: None,
         routing_data: None,
         jailed_text: None,
+        decoder_state: None,
     }
 }
 
@@ -316,6 +317,7 @@ async fn test_streaming_named_tool_buffers_until_finish() {
             engine_data: None,
             routing_data: None,
             jailed_text: None,
+            decoder_state: None,
         };
 
         let response = generator
@@ -388,6 +390,7 @@ async fn test_streaming_required_tool_parallel() {
             engine_data: None,
             routing_data: None,
             jailed_text: None,
+            decoder_state: None,
         };
 
         let response = generator
@@ -462,6 +465,7 @@ fn test_no_tool_choice_outputs_normal_text() {
         engine_data: None,
         routing_data: None,
         jailed_text: None,
+        decoder_state: None,
     };
 
     let response = generator

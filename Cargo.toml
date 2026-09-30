@@ -4,7 +4,7 @@
 [patch.crates-io]
 # Review pin until the companion tokenizer fix is published. All consuming Cargo roots
 # must use the same source, including transitive renderer/parser dependencies.
-dynamo-tokenizers = { git = "https://github.com/alexeldeib/frontend-crates.git", rev = "3d6be16959d4710ed24fb81e04eace132aefa025" }
+dynamo-tokenizers = { git = "https://github.com/alexeldeib/frontend-crates.git", rev = "e70af9d7823dc7471fb2d342940f42413995a603" }
 
 [workspace]
 members = [
