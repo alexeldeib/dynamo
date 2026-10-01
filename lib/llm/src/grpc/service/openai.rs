@@ -344,6 +344,7 @@ impl TryFrom<inference::ModelInferRequest> for NvCreateCompletionRequest {
         };
 
         Ok(NvCreateCompletionRequest {
+            prompt_cache_key: None,
             inner: CreateCompletionRequest {
                 model: request.model_name,
                 prompt: Prompt::String(text_input),

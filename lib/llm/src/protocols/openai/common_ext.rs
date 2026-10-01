@@ -11,6 +11,11 @@ use crate::protocols::common::GuidedDecodingOptions;
 /// but are commonly needed across different request types.
 #[derive(ToSchema, Serialize, Deserialize, Builder, Validate, Debug, Clone, Default)]
 pub struct CommonExt {
+    /// Caller identity used for session affinity after prompt_cache_key and before user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub safety_identifier: Option<String>,
+
     /// If true, the model will ignore the end of string token and generate to max_tokens.
     /// This field can also be specified in nvext, but the root-level value takes precedence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -178,6 +183,7 @@ mod tests {
     fn test_validation_min_tokens() {
         // Test that min_tokens with 0 is valid
         let common_ext = CommonExt {
+            safety_identifier: None,
             ignore_eos: None,
             min_tokens: Some(0), // Should be valid (min = 0)
             top_k: None,

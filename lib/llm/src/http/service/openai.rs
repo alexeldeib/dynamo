@@ -55,6 +55,10 @@ use super::{
     },
     service_v2::{self, BackendErrorCheck},
 };
+use crate::discovery::worker_set_selection::{
+    self, SelectionConfig, WORKER_SET_PINNED_CONTEXT_KEY, chat_affinity_key,
+    completion_affinity_key,
+};
 use crate::engines::ValidateRequest;
 use crate::preprocessor::{PRESERVE_OMITTED_MAX_TOKENS_CONTEXT_KEY, decode_base64_to_floats};
 use crate::protocols::common::extensions::{
@@ -1106,6 +1110,9 @@ where
     if let Some(session_affinity) = session_affinity_from_headers(headers) {
         request.insert(SESSION_AFFINITY_CONTEXT_KEY, session_affinity);
     }
+    if SelectionConfig::global().is_pinned(headers) {
+        request.insert(WORKER_SET_PINNED_CONTEXT_KEY, true);
+    }
     Ok(request)
 }
 
@@ -1131,6 +1138,9 @@ fn copy_context_metadata<T: Send + Sync + 'static, U: Send + Sync + 'static>(
             SESSION_AFFINITY_CONTEXT_KEY,
             session_affinity.as_ref().clone(),
         );
+    }
+    if let Ok(pinned) = source.get::<bool>(WORKER_SET_PINNED_CONTEXT_KEY) {
+        target.insert(WORKER_SET_PINNED_CONTEXT_KEY, *pinned);
     }
 }
 
@@ -1293,14 +1303,23 @@ async fn completions_single(
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metric_model);
 
     // todo - error handling should be more robust
-    let (engine, parsing_options) = state
-        .manager()
-        .get_completions_engine_with_parsing(&model)
-        .map_err(|e| {
-            let err_response = ErrorMessage::from_model_error(&e);
-            inflight_guard.mark_error(extract_error_type_from_response(&err_response));
-            err_response
-        })?;
+    let affinity =
+        worker_set_selection::request_affinity(SelectionConfig::global(), &mut request, |body| {
+            worker_set_selection::openai_identity_key(
+                body.prompt_cache_key.as_deref(),
+                body.common.safety_identifier.as_deref(),
+                body.inner.user.as_deref(),
+            )
+            .or_else(|| completion_affinity_key(None, &body.inner.prompt))
+        });
+    let (engine, parsing_options) = worker_set_selection::with_affinity(affinity, || {
+        state.manager().get_completions_engine_with_parsing(&model)
+    })
+    .map_err(|e| {
+        let err_response = ErrorMessage::from_model_error(&e);
+        inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+        err_response
+    })?;
 
     let mut response_collector = state
         .metrics_clone()
@@ -1584,14 +1603,23 @@ async fn completions_batch(
     // Create http_queue_guard early - tracks time waiting to be processed
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metric_model);
 
-    let (engine, parsing_options) = state
-        .manager()
-        .get_completions_engine_with_parsing(&model)
-        .map_err(|e| {
-            let err_response = ErrorMessage::from_model_error(&e);
-            inflight_guard.mark_error(extract_error_type_from_response(&err_response));
-            err_response
-        })?;
+    let affinity =
+        worker_set_selection::request_affinity(SelectionConfig::global(), &mut request, |body| {
+            worker_set_selection::openai_identity_key(
+                body.prompt_cache_key.as_deref(),
+                body.common.safety_identifier.as_deref(),
+                body.inner.user.as_deref(),
+            )
+            .or_else(|| completion_affinity_key(None, &body.inner.prompt))
+        });
+    let (engine, parsing_options) = worker_set_selection::with_affinity(affinity, || {
+        state.manager().get_completions_engine_with_parsing(&model)
+    })
+    .map_err(|e| {
+        let err_response = ErrorMessage::from_model_error(&e);
+        inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+        err_response
+    })?;
 
     let mut response_collector = state
         .metrics_clone()
@@ -3542,14 +3570,25 @@ async fn chat_completions(
 
     tracing::trace!("Getting chat completions engine for model: {}", model);
 
-    let (engine, parsing_options) = state
-        .manager()
-        .get_chat_completions_engine_with_parsing(&model)
-        .map_err(|e| {
-            let err_response = ErrorMessage::from_model_error(&e);
-            inflight_guard.mark_error(extract_error_type_from_response(&err_response));
-            err_response
-        })?;
+    let affinity =
+        worker_set_selection::request_affinity(SelectionConfig::global(), &mut request, |body| {
+            worker_set_selection::openai_identity_key(
+                body.inner.prompt_cache_key.as_deref(),
+                body.common.safety_identifier.as_deref(),
+                body.inner.user.as_deref(),
+            )
+            .or_else(|| chat_affinity_key(None, &body.inner.messages))
+        });
+    let (engine, parsing_options) = worker_set_selection::with_affinity(affinity, || {
+        state
+            .manager()
+            .get_chat_completions_engine_with_parsing(&model)
+    })
+    .map_err(|e| {
+        let err_response = ErrorMessage::from_model_error(&e);
+        inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+        err_response
+    })?;
 
     // Request policy controls whether parser-produced tool calls may be exposed.
     // Assistant response/guided constraints are handled separately during
@@ -4245,14 +4284,25 @@ async fn responses(
 
     tracing::trace!("Getting chat completions engine for model: {}", model);
 
-    let (engine, parsing_options) = state
-        .manager()
-        .get_chat_completions_engine_with_parsing(&model)
-        .map_err(|e| {
-            let err_response = ErrorMessage::from_model_error(&e);
-            inflight_guard.mark_error(extract_error_type_from_response(&err_response));
-            err_response
-        })?;
+    let affinity =
+        worker_set_selection::request_affinity(SelectionConfig::global(), &mut request, |body| {
+            worker_set_selection::openai_identity_key(
+                response_params.prompt_cache_key.as_deref(),
+                response_params.safety_identifier.as_deref(),
+                body.inner.user.as_deref(),
+            )
+            .or_else(|| chat_affinity_key(None, &body.inner.messages))
+        });
+    let (engine, parsing_options) = worker_set_selection::with_affinity(affinity, || {
+        state
+            .manager()
+            .get_chat_completions_engine_with_parsing(&model)
+    })
+    .map_err(|e| {
+        let err_response = ErrorMessage::from_model_error(&e);
+        inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+        err_response
+    })?;
 
     // The Responses API is converted to the same chat request contract. Narrow
     // the model parser before unary aggregation just as the streaming path does.
@@ -6603,6 +6653,28 @@ mod tests {
     }
 
     #[test]
+    fn test_context_metadata_preserves_resolved_body_affinity_for_batch() {
+        let config = SelectionConfig {
+            mode: worker_set_selection::SelectionMode::AffinityRendezvous,
+            own_namespace: Some("revision-1".to_string()),
+            pin_header: None,
+        };
+        let mut source = Context::new(());
+        worker_set_selection::request_affinity(&config, &mut source, |_| {
+            Some("cache-key".to_string())
+        });
+        let mut target = Context::new(());
+        copy_context_metadata(&source, &mut target);
+        assert_eq!(
+            target
+                .get::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
+                .expect("resolved body affinity copied to batch item")
+                .as_str(),
+            "cache-key"
+        );
+    }
+
+    #[test]
     fn test_http_error_response_from_anyhow() {
         let err = http_error_from_engine(400).unwrap_err();
         let response = ErrorMessage::from_anyhow(err, BACKUP_ERROR_MESSAGE);
@@ -8324,6 +8396,7 @@ mod tests {
     fn test_bad_base_request_for_completion() {
         // Frequency Penalty: Should be a float between -2.0 and 2.0
         let request = NvCreateCompletionRequest {
+            prompt_cache_key: None,
             inner: CreateCompletionRequest {
                 model: "test-model".to_string(),
                 prompt: "Hello".into(),
@@ -8349,6 +8422,7 @@ mod tests {
 
         // Presence Penalty: Should be a float between -2.0 and 2.0
         let request = NvCreateCompletionRequest {
+            prompt_cache_key: None,
             inner: CreateCompletionRequest {
                 model: "test-model".to_string(),
                 prompt: "Hello".into(),
@@ -8373,6 +8447,7 @@ mod tests {
 
         // Temperature: Should be a float between 0.0 and 2.0
         let request = NvCreateCompletionRequest {
+            prompt_cache_key: None,
             inner: CreateCompletionRequest {
                 model: "test-model".to_string(),
                 prompt: "Hello".into(),
@@ -8397,6 +8472,7 @@ mod tests {
 
         // Top P: Should be a float between 0.0 and 1.0
         let request = NvCreateCompletionRequest {
+            prompt_cache_key: None,
             inner: CreateCompletionRequest {
                 model: "test-model".to_string(),
                 prompt: "Hello".into(),
@@ -8421,6 +8497,7 @@ mod tests {
 
         // Repetition Penalty: Should be a float between 0.0 and 2.0
         let request = NvCreateCompletionRequest {
+            prompt_cache_key: None,
             inner: CreateCompletionRequest {
                 model: "test-model".to_string(),
                 prompt: "Hello".into(),
@@ -8447,6 +8524,7 @@ mod tests {
 
         // Logprobs: Should be a positive integer between 0 and 5
         let request = NvCreateCompletionRequest {
+            prompt_cache_key: None,
             inner: CreateCompletionRequest {
                 model: "test-model".to_string(),
                 prompt: "Hello".into(),
@@ -8476,6 +8554,7 @@ mod tests {
 
         // Test metadata field with nested object
         let request = NvCreateCompletionRequest {
+            prompt_cache_key: None,
             inner: CreateCompletionRequest {
                 model: "test-model".to_string(),
                 prompt: "Hello".into(),

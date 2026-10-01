@@ -10866,6 +10866,7 @@ mod tests {
         let preprocessor = OpenAIPreprocessor::new(mdc).unwrap();
 
         let request = NvCreateCompletionRequest {
+            prompt_cache_key: None,
             inner: dynamo_protocols::types::CreateCompletionRequest {
                 model: "test-model".to_string(),
                 prompt: dynamo_protocols::types::Prompt::IntegerArray(vec![1, 2, 3]),

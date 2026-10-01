@@ -41,6 +41,9 @@ use super::{
     },
     service_v2::{self, BackendErrorCheck},
 };
+use crate::discovery::worker_set_selection::{
+    self, SelectionConfig, WORKER_SET_PINNED_CONTEXT_KEY, anthropic_affinity_key,
+};
 use crate::engines::ValidateRequest;
 use crate::protocols::anthropic::stream_converter::AnthropicStreamConverter;
 use crate::protocols::anthropic::types::{
@@ -427,6 +430,9 @@ async fn handler_anthropic_messages(
     if let Some(session_affinity) = session_affinity_from_headers(&headers) {
         request.insert(SESSION_AFFINITY_CONTEXT_KEY, session_affinity);
     }
+    if SelectionConfig::global().is_pinned(&headers) {
+        request.insert(WORKER_SET_PINNED_CONTEXT_KEY, true);
+    }
     let context = request.context();
 
     // Create connection handles
@@ -508,31 +514,37 @@ async fn anthropic_messages(
 
     // Look up engine and parsing options early so we know whether a reasoning
     // parser is configured before converting the request.
-    let (engine, parsing_options) = state
-        .manager()
-        .get_chat_completions_engine_with_parsing(&model)
-        .map_err(|e| match e {
-            // Registered but not ready to serve yet → retryable 503 (mapped to
-            // "overloaded_error" by `anthropic_error`). Reuses the OpenAI path's
-            // canonical, customer-facing message so both APIs report the same
-            // text. Anything else is a genuine missing model → 404.
-            crate::discovery::ModelManagerError::ModelUnavailable(_) => AnthropicHandlerError::new(
-                ErrorClass::Unavailable,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "overloaded_error",
-                super::openai::model_not_ready_message(&model),
-                ErrorType::Unavailable,
-            )
-            .into_marked_response(&mut inflight_guard),
-            _ => AnthropicHandlerError::new(
-                ErrorClass::NotFound,
-                StatusCode::NOT_FOUND,
-                "not_found_error",
-                format!("Model '{}' not found", model),
-                ErrorType::NotFound,
-            )
-            .into_marked_response(&mut inflight_guard),
-        })?;
+    let affinity =
+        worker_set_selection::request_affinity(SelectionConfig::global(), &mut request, |body| {
+            anthropic_affinity_key(body.metadata.as_ref(), body.system.as_ref(), &body.messages)
+        });
+    let (engine, parsing_options) = worker_set_selection::with_affinity(affinity, || {
+        state
+            .manager()
+            .get_chat_completions_engine_with_parsing(&model)
+    })
+    .map_err(|e| match e {
+        // Registered but not ready to serve yet → retryable 503 (mapped to
+        // "overloaded_error" by `anthropic_error`). Reuses the OpenAI path's
+        // canonical, customer-facing message so both APIs report the same
+        // text. Anything else is a genuine missing model → 404.
+        crate::discovery::ModelManagerError::ModelUnavailable(_) => AnthropicHandlerError::new(
+            ErrorClass::Unavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "overloaded_error",
+            super::openai::model_not_ready_message(&model),
+            ErrorType::Unavailable,
+        )
+        .into_marked_response(&mut inflight_guard),
+        _ => AnthropicHandlerError::new(
+            ErrorClass::NotFound,
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            format!("Model '{}' not found", model),
+            ErrorType::NotFound,
+        )
+        .into_marked_response(&mut inflight_guard),
+    })?;
 
     let (orig_request, context) = request.into_parts();
     let model_for_resp = orig_request.model.clone();

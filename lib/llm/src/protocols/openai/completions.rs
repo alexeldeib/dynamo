@@ -29,6 +29,10 @@ pub use delta::DeltaGenerator;
 
 #[derive(ToSchema, Serialize, Deserialize, Validate, Debug, Clone)]
 pub struct NvCreateCompletionRequest {
+    /// Stable cache/session identity, preferred over safety_identifier and user for affinity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+
     #[serde(flatten)]
     #[schema(value_type = Object)]
     pub inner: dynamo_protocols::types::CreateCompletionRequest,

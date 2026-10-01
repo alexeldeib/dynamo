@@ -769,6 +769,7 @@ fn create_cmpl_request(include_usage: Option<bool>, stream: bool) -> NvCreateCom
     };
 
     NvCreateCompletionRequest {
+        prompt_cache_key: None,
         inner,
         common: Default::default(),
         nvext: None,

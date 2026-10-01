@@ -15,6 +15,7 @@ use serde::Serialize;
 use super::ModelManagerError;
 use super::worker_monitor::LoadThresholdConfig;
 use super::worker_set::WorkerSet;
+use super::worker_set_selection;
 use crate::local_model::runtime_config::VLLM_ENABLE_TOWER_CONNECTOR_LORA_RUNTIME_KEY;
 use crate::protocols::openai::ParsingOptions;
 
@@ -785,14 +786,14 @@ impl Model {
         // a namespace whose worker set is incomplete.
         // In-process models (no discovery watcher) return count=1, so they always participate.
         // Discovery models with count=0 have no available workers and are skipped.
-        let eligible: Vec<(T, usize)> = snapshot
+        let eligible: Vec<(T, usize, &str)> = snapshot
             .iter()
             .filter_map(|ws| {
                 let count = ws.worker_count();
                 if count == 0 || !ready_namespaces.contains(ws.namespace()) {
                     return None;
                 }
-                extract(ws).map(|val| (val, count))
+                extract(ws).map(|val| (val, count, ws.namespace()))
             })
             .collect();
 
@@ -801,13 +802,21 @@ impl Model {
         }
 
         if eligible.len() == 1 {
-            return eligible.into_iter().next().map(|(val, _)| val);
+            return eligible.into_iter().next().map(|(val, _, _)| val);
+        }
+
+        let candidates: Vec<(&str, usize)> = eligible
+            .iter()
+            .map(|(_, count, namespace)| (*namespace, *count))
+            .collect();
+        if let Some(index) = worker_set_selection::choose_for_current_request(&candidates) {
+            return eligible.into_iter().nth(index).map(|(val, _, _)| val);
         }
 
         // Weighted random selection proportional to worker count
-        let total_weight: usize = eligible.iter().map(|(_, w)| w).sum();
+        let total_weight: usize = eligible.iter().map(|(_, w, _)| w).sum();
         let mut pick = rand::rng().random_range(0..total_weight);
-        for (val, weight) in eligible {
+        for (val, weight, _) in eligible {
             if pick < weight {
                 return Some(val);
             }
@@ -1066,6 +1075,46 @@ mod tests {
         assert_eq!(selection_b.kv_cache_block_size, 32);
         assert_eq!(selection_b.lora_name.as_deref(), Some("adapter-b"));
         assert!(selection_b.tower_connector_lora_enabled);
+    }
+
+    #[test]
+    fn test_select_worker_set_follows_request_affinity() {
+        use crate::discovery::worker_set_selection::{WorkerSetAffinity, with_affinity};
+
+        let model = Model::new("generate-model".to_string());
+        let (worker_set_a, engine_a, _worker_tx_a) =
+            make_generate_worker_set("ns-a", 16, None, false);
+        let (worker_set_b, engine_b, _worker_tx_b) =
+            make_generate_worker_set("ns-b", 16, None, false);
+        model.add_worker_set("ns-a".to_string(), worker_set_a);
+        model.add_worker_set("ns-b".to_string(), worker_set_b);
+
+        for (pinned, want) in [("ns-a", &engine_a), ("ns-b", &engine_b)] {
+            let affinity = WorkerSetAffinity {
+                key: None,
+                pinned_namespace: Some(pinned.to_string()),
+            };
+            for _ in 0..50 {
+                let engine = with_affinity(Some(affinity.clone()), || model.get_generate_engine())
+                    .expect("select pinned worker set");
+                assert!(Arc::ptr_eq(&engine, want), "pinned to {pinned}");
+            }
+        }
+
+        let keyed = WorkerSetAffinity {
+            key: Some("session-1".to_string()),
+            pinned_namespace: None,
+        };
+        let first = with_affinity(Some(keyed.clone()), || model.get_generate_engine())
+            .expect("select keyed worker set");
+        for _ in 0..50 {
+            let engine = with_affinity(Some(keyed.clone()), || model.get_generate_engine())
+                .expect("select keyed worker set");
+            assert!(
+                Arc::ptr_eq(&engine, &first),
+                "keyed selection must be sticky"
+            );
+        }
     }
 
     fn make_realtime_worker_set(namespace: &str) -> Arc<WorkerSet> {

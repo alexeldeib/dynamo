@@ -317,6 +317,7 @@ mod tests {
             .expect("completion request");
 
         NvCreateCompletionRequest {
+            prompt_cache_key: None,
             inner,
             common: Default::default(),
             nvext: None,
@@ -378,6 +379,7 @@ mod tests {
             .expect("completion request");
 
         NvCreateCompletionRequest {
+            prompt_cache_key: None,
             inner,
             common: Default::default(),
             nvext: Some(

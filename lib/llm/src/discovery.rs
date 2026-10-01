@@ -26,6 +26,8 @@ mod controller;
 
 mod allocator;
 
+pub mod worker_set_selection;
+
 mod worker_set;
 pub use worker_set::WorkerSet;
 pub(crate) use worker_set::{CommittedWorkerSetTarget, WorkerSetTarget, WorkerSetTargetId};
