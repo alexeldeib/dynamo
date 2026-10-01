@@ -74,6 +74,18 @@ pub struct AffinityVersion {
 /// Receives every binding this table publishes for its replicas.
 pub trait AffinityReplicaSink: Send + Sync {
     fn publish(&self, session_id: &str, target: AffinityTarget, version: AffinityVersion);
+
+    /// Transports supporting replay carry the absolute idle expiry. Existing
+    /// sinks retain their request-driven publication behavior.
+    fn publish_with_expiry(
+        &self,
+        session_id: &str,
+        target: AffinityTarget,
+        version: AffinityVersion,
+        _expires_at_ms: u64,
+    ) {
+        self.publish(session_id, target, version);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +98,24 @@ pub enum ReplicaApplyOutcome {
     IgnoredConflict,
     RejectedSessionId,
     RejectedCapacity,
+    RejectedExpired,
+}
+
+/// An owned binding for bounded transport replay. Idle replay must preserve
+/// expires_at_ms; only live requests extend a session's lifetime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AffinityBindingSnapshot {
+    pub session_id: String,
+    pub target: AffinityTarget,
+    pub version: AffinityVersion,
+    pub expires_at_ms: u64,
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 enum AffinityEntry {
@@ -97,6 +127,7 @@ enum AffinityEntry {
         target: AffinityTarget,
         revision: u64,
         version: AffinityVersion,
+        expires_at_ms: u64,
         active_leases: usize,
         idle_deadline: Instant,
     },
@@ -447,6 +478,7 @@ impl SessionAffinity {
             target,
             revision,
             version,
+            expires_at_ms: unix_ms().saturating_add(self.inner.ttl.as_millis() as u64),
             // Reserve the initializer's use until it commits or cancels.
             active_leases: 2,
             idle_deadline: Instant::now() + self.inner.ttl,
@@ -537,7 +569,31 @@ impl SessionAffinity {
         target: AffinityTarget,
         version: AffinityVersion,
     ) -> ReplicaApplyOutcome {
-        self.inner.apply_replica_update(session_id, target, version)
+        self.inner
+            .apply_replica_update(session_id, target, version, None)
+    }
+
+    /// Apply a replayable binding without refreshing its absolute idle expiry.
+    /// None accepts a legacy event with the table's configured TTL.
+    pub fn apply_replica_update_with_expiry(
+        &self,
+        session_id: String,
+        target: AffinityTarget,
+        version: AffinityVersion,
+        expires_at_ms: Option<u64>,
+    ) -> ReplicaApplyOutcome {
+        self.inner
+            .apply_replica_update(session_id, target, version, expires_at_ms)
+    }
+
+    /// Return at most limit bindings and a cursor for the next batch. Zero
+    /// marks the end of a sweep. No transport dependency belongs in the table.
+    pub fn snapshot_bindings(
+        &self,
+        cursor: usize,
+        limit: usize,
+    ) -> (Vec<AffinityBindingSnapshot>, usize) {
+        self.inner.snapshot_bindings(cursor, limit)
     }
 
     fn validate_session_id(&self, session_id: &str) -> Result<(), AffinityError> {
@@ -621,9 +677,80 @@ impl Inner {
         target: AffinityTarget,
         version: AffinityVersion,
     ) {
+        // An old stream must not advertise a binding that another replica replaced.
+        let expires_at_ms = {
+            let Some(entry) = self.entries.get(session_id) else {
+                return;
+            };
+            let AffinityEntry::Bound {
+                target: current,
+                version: current_version,
+                active_leases,
+                expires_at_ms,
+                ..
+            } = entry.value()
+            else {
+                return;
+            };
+            if *current != target || *current_version != version {
+                return;
+            }
+            if *active_leases > 0 {
+                unix_ms().saturating_add(self.ttl.as_millis() as u64)
+            } else {
+                *expires_at_ms
+            }
+        };
         if let Some(replica) = self.replica.get() {
-            replica.publish(session_id, target, version);
+            replica.publish_with_expiry(session_id, target, version, expires_at_ms);
         }
+    }
+
+    /// Bounded anti-entropy replay. Preserve the binding's absolute idle expiry:
+    /// replica heartbeats must never refresh each other forever without requests.
+    fn snapshot_bindings(
+        &self,
+        cursor: usize,
+        limit: usize,
+    ) -> (Vec<AffinityBindingSnapshot>, usize) {
+        let now = Instant::now();
+        let mut visited = 0;
+        let mut updates = Vec::new();
+        for entry in self.entries.iter().skip(cursor).take(limit) {
+            visited += 1;
+            let AffinityEntry::Bound {
+                target,
+                version,
+                active_leases,
+                idle_deadline,
+                expires_at_ms,
+                ..
+            } = entry.value()
+            else {
+                continue;
+            };
+            if *active_leases == 0 && *idle_deadline <= now {
+                continue;
+            }
+            updates.push(AffinityBindingSnapshot {
+                session_id: entry.key().clone(),
+                target: *target,
+                version: *version,
+                expires_at_ms: if *active_leases > 0 {
+                    unix_ms().saturating_add(self.ttl.as_millis() as u64)
+                } else {
+                    *expires_at_ms
+                },
+            });
+        }
+        (
+            updates,
+            if visited < limit {
+                0
+            } else {
+                cursor.saturating_add(visited)
+            },
+        )
     }
 
     fn next_version(&self) -> AffinityVersion {
@@ -643,13 +770,25 @@ impl Inner {
         session_id: String,
         target: AffinityTarget,
         version: AffinityVersion,
+        expires_at_ms: Option<u64>,
     ) -> ReplicaApplyOutcome {
         if session_id.len() > self.max_session_id_bytes {
             return ReplicaApplyOutcome::RejectedSessionId;
         }
         self.observe_replica_sequence(version.sequence);
-
+        let wall_now = unix_ms();
+        let ttl_ms = self.ttl.as_millis() as u64;
+        // Missing expiry/version fields are the legacy frontend wire format.
+        let remaining_ms = expires_at_ms
+            .map(|expires| expires.saturating_sub(wall_now))
+            .unwrap_or(ttl_ms)
+            .min(ttl_ms);
+        if remaining_ms == 0 {
+            return ReplicaApplyOutcome::RejectedExpired;
+        }
+        let expires_at_ms = wall_now.saturating_add(remaining_ms);
         let now = Instant::now();
+        let deadline = now + Duration::from_millis(remaining_ms);
         match self.entries.entry(session_id) {
             Entry::Vacant(entry) => {
                 if !self.reserve_entry() {
@@ -660,25 +799,34 @@ impl Inner {
                     target,
                     revision,
                     version,
+                    expires_at_ms,
                     active_leases: 0,
-                    idle_deadline: now + self.ttl,
+                    idle_deadline: deadline,
                 });
                 ReplicaApplyOutcome::Inserted
             }
             Entry::Occupied(mut entry) => match entry.get_mut() {
+                // Observe the sequence even while selection is in flight. Its
+                // eventual commit receives a newer version; replay repairs a
+                // missed initializing update after selection finishes.
                 AffinityEntry::Initializing { .. } => ReplicaApplyOutcome::IgnoredInitializing,
                 AffinityEntry::Bound {
+                    version: existing_version,
                     active_leases,
                     idle_deadline,
                     ..
-                } if *active_leases == 0 && *idle_deadline <= now => {
+                } if *active_leases == 0
+                    && *idle_deadline <= now
+                    && version >= *existing_version =>
+                {
                     let revision = self.next_revision.fetch_add(1, Ordering::Relaxed);
                     *entry.get_mut() = AffinityEntry::Bound {
                         target,
                         revision,
                         version,
+                        expires_at_ms,
                         active_leases: 0,
-                        idle_deadline: now + self.ttl,
+                        idle_deadline: deadline,
                     };
                     ReplicaApplyOutcome::ReplacedExpired
                 }
@@ -686,21 +834,27 @@ impl Inner {
                     target: existing,
                     version: existing_version,
                     idle_deadline,
+                    expires_at_ms: expiry,
                     ..
                 } if *existing == target && version >= *existing_version => {
                     *existing_version = version;
-                    *idle_deadline = now + self.ttl;
+                    *idle_deadline = (*idle_deadline).max(deadline);
+                    *expiry = (*expiry).max(expires_at_ms);
                     ReplicaApplyOutcome::Refreshed
                 }
                 AffinityEntry::Bound {
                     target: existing,
                     version: existing_version,
                     idle_deadline,
+                    expires_at_ms: expiry,
                     ..
                 } if version > *existing_version => {
+                    // Keep the local revision and lease count: old requests
+                    // finish normally, but cannot refresh/invalidate this winner.
                     *existing = target;
                     *existing_version = version;
-                    *idle_deadline = now + self.ttl;
+                    *idle_deadline = deadline;
+                    *expiry = expires_at_ms;
                     ReplicaApplyOutcome::ReplacedNewer
                 }
                 AffinityEntry::Bound { .. } => ReplicaApplyOutcome::IgnoredConflict,
@@ -774,6 +928,7 @@ impl AffinityInitialization {
             target,
             revision: self.revision,
             version,
+            expires_at_ms: unix_ms().saturating_add(inner.ttl.as_millis() as u64),
             active_leases: 1,
             idle_deadline: Instant::now() + inner.ttl,
         };
@@ -901,6 +1056,7 @@ impl AffinityLease {
                 target,
                 revision,
                 version,
+                expires_at_ms,
                 active_leases,
                 idle_deadline,
             } = entry.value_mut()
@@ -915,6 +1071,7 @@ impl AffinityLease {
                 return;
             }
             *idle_deadline = Instant::now() + inner.ttl;
+            *expires_at_ms = unix_ms().saturating_add(inner.ttl.as_millis() as u64);
             (*target, *version)
         };
         inner.publish_replica_update(&self.session_id, target, version);
@@ -1194,5 +1351,118 @@ mod tests {
         drop(lease);
         drop(joined);
         assert_eq!(table.lease_count("s"), Some(0));
+    }
+
+    #[tokio::test]
+    async fn replay_repairs_lost_events_without_extending_idle_lifetime() {
+        let origin = table();
+        let peer = table();
+        let target = AffinityTarget::new(2, Some(0));
+        drop(initialize(&origin).commit(target).expect("commit"));
+        let (bindings, _) = origin.snapshot_bindings(0, 4);
+        let binding = &bindings[0];
+        assert_eq!(peer.query_target("s", None).unwrap(), None);
+        assert_eq!(
+            peer.apply_replica_update_with_expiry(
+                binding.session_id.clone(),
+                binding.target,
+                binding.version,
+                Some(binding.expires_at_ms),
+            ),
+            ReplicaApplyOutcome::Inserted
+        );
+        assert_eq!(peer.query_target("s", None).unwrap(), Some(target));
+        // Repeated relays cannot keep an idle session alive indefinitely.
+        for _ in 0..3 {
+            let relay = peer.snapshot_bindings(0, 4).0.remove(0);
+            assert_eq!(relay.expires_at_ms, binding.expires_at_ms);
+            assert_eq!(
+                origin.apply_replica_update_with_expiry(
+                    relay.session_id,
+                    relay.target,
+                    relay.version,
+                    Some(relay.expires_at_ms),
+                ),
+                ReplicaApplyOutcome::Refreshed
+            );
+            assert_eq!(
+                origin.snapshot_bindings(0, 4).0[0].expires_at_ms,
+                binding.expires_at_ms
+            );
+        }
+        assert_eq!(
+            peer.apply_replica_update_with_expiry(
+                "expired".into(),
+                target,
+                binding.version,
+                Some(unix_ms().saturating_sub(1)),
+            ),
+            ReplicaApplyOutcome::RejectedExpired
+        );
+        assert_eq!(peer.query_target("expired", None).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn bounded_replay_covers_the_table_and_skips_expired_bindings() {
+        use std::collections::HashSet;
+        let table = table();
+        for i in 0..13 {
+            let session = format!("s-{i}");
+            let hold = table.acquire(&session, None).await.unwrap();
+            drop(table.commit(hold, AffinityTarget::new(2, None)).unwrap());
+        }
+        table.expire_for_test("s-0");
+        let mut cursor = 0;
+        let mut seen = HashSet::new();
+        for _ in 0..5 {
+            let (bindings, next) = table.snapshot_bindings(cursor, 4);
+            assert!(bindings.len() <= 4);
+            seen.extend(bindings.into_iter().map(|b| b.session_id));
+            cursor = next;
+            if cursor == 0 {
+                break;
+            }
+        }
+        assert_eq!(cursor, 0);
+        assert_eq!(seen.len(), 12);
+        assert!(!seen.contains("s-0"));
+    }
+
+    #[tokio::test]
+    async fn delayed_old_replay_cannot_replace_an_expired_newer_binding() {
+        let table = table();
+        let target = AffinityTarget::new(2, None);
+        let current = AffinityVersion {
+            sequence: 40,
+            writer_id: 7,
+        };
+        assert_eq!(
+            table.apply_replica_update("s".into(), target, current),
+            ReplicaApplyOutcome::Inserted
+        );
+        table.expire_for_test("s");
+        assert_eq!(
+            table.apply_replica_update(
+                "s".into(),
+                AffinityTarget::new(3, None),
+                AffinityVersion {
+                    sequence: 39,
+                    writer_id: 9
+                }
+            ),
+            ReplicaApplyOutcome::IgnoredConflict
+        );
+        assert_eq!(table.query_target("s", None).unwrap(), None);
+        assert_eq!(
+            table.apply_replica_update(
+                "s".into(),
+                AffinityTarget::new(3, None),
+                AffinityVersion {
+                    sequence: 41,
+                    writer_id: 9
+                }
+            ),
+            ReplicaApplyOutcome::ReplacedExpired
+        );
     }
 }

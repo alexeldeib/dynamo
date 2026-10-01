@@ -620,7 +620,13 @@ async fn session_affinity_publishes_after_dispatch_and_lease_completion() {
 
     drop(stream);
     let after_completion = updates.recv().await.unwrap();
-    assert_eq!(after_completion, after_dispatch);
+    assert_eq!(after_completion.session_id, after_dispatch.session_id);
+    assert_eq!(after_completion.worker_id, after_dispatch.worker_id);
+    assert_eq!(after_completion.dp_rank, after_dispatch.dp_rank);
+    assert_eq!(after_completion.sequence, after_dispatch.sequence);
+    assert_eq!(after_completion.writer_id, after_dispatch.writer_id);
+    assert!(after_dispatch.expires_at_ms.is_some());
+    assert!(after_completion.expires_at_ms >= after_dispatch.expires_at_ms);
     assert!(updates.try_recv().is_err());
 }
 

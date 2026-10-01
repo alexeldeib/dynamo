@@ -35,8 +35,12 @@ pub(super) struct SessionAffinityUpdate {
     pub session_id: String,
     pub worker_id: u64,
     pub dp_rank: Option<u32>,
+    #[serde(default)]
     pub sequence: u64,
+    #[serde(default)]
     pub writer_id: u64,
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -46,12 +50,35 @@ struct ReplicaUpdateSender {
 
 impl AffinityReplicaSink for ReplicaUpdateSender {
     fn publish(&self, session_id: &str, target: AffinityTarget, version: AffinityVersion) {
+        self.send(session_id, target, version, None);
+    }
+
+    fn publish_with_expiry(
+        &self,
+        session_id: &str,
+        target: AffinityTarget,
+        version: AffinityVersion,
+        expires_at_ms: u64,
+    ) {
+        self.send(session_id, target, version, Some(expires_at_ms));
+    }
+}
+
+impl ReplicaUpdateSender {
+    fn send(
+        &self,
+        session_id: &str,
+        target: AffinityTarget,
+        version: AffinityVersion,
+        expires_at_ms: Option<u64>,
+    ) {
         let update = SessionAffinityUpdate {
             session_id: session_id.to_string(),
             worker_id: target.worker_id,
             dp_rank: target.dp_rank,
             sequence: version.sequence,
             writer_id: version.writer_id,
+            expires_at_ms,
         };
         if let Err(error) = self.tx.try_send(update) {
             tracing::trace!(
@@ -90,13 +117,14 @@ impl ReplicaUpdateApplier {
             return true;
         }
         let target = AffinityTarget::new(update.worker_id, update.dp_rank);
-        let outcome = table.apply_replica_update(
+        let outcome = table.apply_replica_update_with_expiry(
             update.session_id,
             target,
             AffinityVersion {
                 sequence: update.sequence,
                 writer_id: update.writer_id,
             },
+            update.expires_at_ms,
         );
         drop(table);
         tracing::trace!(
@@ -133,7 +161,7 @@ impl ReplicaSyncRuntime {
         let applier = ReplicaUpdateApplier {
             local_publisher_id: publisher_id,
             discovered_instances: client.instance_source.as_ref().clone(),
-            table,
+            table: table.clone(),
         };
 
         let cancel = CancellationToken::new();
@@ -216,10 +244,36 @@ impl ReplicaSyncRuntime {
 
         let publisher_cancel = cancel.clone();
         let publisher_task = tokio::spawn(async move {
+            let mut reconcile = tokio::time::interval(std::time::Duration::from_secs(1));
+            reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut cursor = 0;
             loop {
                 let update = tokio::select! {
                     _ = publisher_cancel.cancelled() => return,
                     update = rx.recv() => update,
+                    _ = reconcile.tick() => {
+                        let Some(table) = table.upgrade() else { return };
+                        let (bindings, next_cursor) = table.snapshot_bindings(cursor, 512);
+                        cursor = next_cursor;
+                        drop(table);
+                        for binding in bindings {
+                            let update = SessionAffinityUpdate {
+                                session_id: binding.session_id,
+                                worker_id: binding.target.worker_id,
+                                dp_rank: binding.target.dp_rank,
+                                sequence: binding.version.sequence,
+                                writer_id: binding.version.writer_id,
+                                expires_at_ms: Some(binding.expires_at_ms),
+                            };
+                            tokio::select! {
+                                _ = publisher_cancel.cancelled() => return,
+                                result = publisher.publish(&update) => {
+                                    if let Err(error) = result { tracing::trace!(%error, "failed to reconcile session affinity binding"); }
+                                }
+                            }
+                        }
+                        continue;
+                    }
                 };
                 let Some(update) = update else {
                     return;
@@ -306,6 +360,16 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn legacy_replica_events_decode_without_expiry_or_version_fields() {
+        let event: SessionAffinityUpdate =
+            serde_json::from_str(r#"{"session_id":"legacy","worker_id":10,"dp_rank":null}"#)
+                .unwrap();
+        assert_eq!(event.sequence, 0);
+        assert_eq!(event.writer_id, 0);
+        assert_eq!(event.expires_at_ms, None);
+    }
+
+    #[test]
     fn direct_sync_is_selected_only_for_unbrokered_zmq() {
         assert!(should_use_direct_sync(EventTransportKind::Zmq, true));
         assert!(!should_use_direct_sync(EventTransportKind::Zmq, false));
@@ -368,6 +432,7 @@ mod tests {
                 dp_rank: Some(0),
                 sequence,
                 writer_id: 9,
+                expires_at_ms: None,
             }
         ));
 
