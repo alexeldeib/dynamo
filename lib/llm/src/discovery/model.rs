@@ -88,6 +88,12 @@ pub(crate) struct GenerateEngineSelection {
     pub(crate) tower_connector_lora_enabled: bool,
 }
 
+pub(crate) struct ChatEngineSelection {
+    pub(crate) engine: OpenAIChatCompletionsStreamingEngine,
+    pub(crate) parsing: ParsingOptions,
+    pub(crate) worker_set: Arc<WorkerSet>,
+}
+
 /// Readiness facts for one namespace, from [`Model::evaluate_namespace`].
 /// Shared by the serving gate and the `/ready` endpoint so they can't diverge.
 struct NamespaceReadinessEval {
@@ -667,6 +673,19 @@ impl Model {
             .ok_or_else(|| self.engine_error(self.has_chat_engine()))
     }
 
+    pub(crate) fn get_chat_engine_selection(
+        &self,
+    ) -> Result<ChatEngineSelection, ModelManagerError> {
+        self.select_worker_set_with(|ws| {
+            ws.chat_engine.clone().map(|engine| ChatEngineSelection {
+                engine,
+                parsing: ws.parsing_options(),
+                worker_set: Arc::clone(ws),
+            })
+        })
+        .ok_or_else(|| self.engine_error(self.has_chat_engine()))
+    }
+
     pub fn get_completions_engine_with_parsing(
         &self,
     ) -> Result<(OpenAICompletionsStreamingEngine, ParsingOptions), ModelManagerError> {
@@ -745,7 +764,7 @@ impl Model {
     ///
     fn select_worker_set_with<T, F>(&self, extract: F) -> Option<T>
     where
-        F: Fn(&WorkerSet) -> Option<T>,
+        F: Fn(&Arc<WorkerSet>) -> Option<T>,
     {
         // One snapshot drives both the readiness filter and candidate
         // eligibility, so a concurrent add/remove can't make us treat a
@@ -754,6 +773,7 @@ impl Model {
         let snapshot: Vec<Arc<WorkerSet>> = self
             .worker_sets
             .iter()
+            .filter(|entry| !worker_set_selection::namespace_is_excluded(entry.value().namespace()))
             .map(|entry| entry.value().clone())
             .collect();
 
@@ -830,6 +850,7 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::local_model::runtime_config::{
         VLLM_ENABLE_TOWER_CONNECTOR_LORA_RUNTIME_KEY, VLLM_INFERENCE_V1_GENERATE_CAPABILITY,
     };
@@ -840,6 +861,36 @@ mod tests {
     use dynamo_runtime::engine::AsyncEngine;
     use dynamo_runtime::pipeline::{Error, ManyOut, SingleIn};
     use tokio::sync::watch;
+
+    #[test]
+    fn failover_exclusion_overrides_pin_without_poisoning_later_requests() {
+        let model = Model::new("m".into());
+        let (old, old_engine, _old_workers) = make_generate_worker_set("old", 16, None, false);
+        let (new, new_engine, _new_workers) = make_generate_worker_set("new", 16, None, false);
+        model.add_worker_set("old".into(), old);
+        model.add_worker_set("new".into(), new);
+        let pin = worker_set_selection::WorkerSetAffinity {
+            key: Some("s".into()),
+            pinned_namespace: Some("old".into()),
+        };
+        worker_set_selection::with_affinity(Some(pin), || {
+            let replacement = worker_set_selection::excluding_namespace(Some("old"), || {
+                model.get_generate_engine().unwrap()
+            });
+            assert!(Arc::ptr_eq(&replacement, &new_engine));
+            assert!(Arc::ptr_eq(
+                &model.get_generate_engine().unwrap(),
+                &old_engine
+            ));
+            model.remove_worker_set("new");
+            assert!(
+                worker_set_selection::excluding_namespace(Some("old"), || {
+                    model.get_generate_engine()
+                })
+                .is_err()
+            );
+        });
+    }
 
     struct StubGenerateEngine;
 

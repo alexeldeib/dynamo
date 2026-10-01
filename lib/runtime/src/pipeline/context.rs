@@ -20,6 +20,28 @@ pub struct Context<T: Data> {
 }
 
 impl<T: Send + Sync + 'static> Context<T> {
+    /// Create an independently cancellable attempt with the same shared request metadata.
+    /// Unique registry values cannot be replayed, so callers must keep their single-attempt path
+    /// when this returns `None`. Cancellation of the original request also cancels the attempt.
+    pub fn fork_shared<U: Send + Sync + 'static>(&self, current: U) -> Option<Context<U>> {
+        let registry = self.registry.clone_shared_only()?;
+        let child = Context {
+            current,
+            controller: Arc::new(Controller::new(self.id().to_string())),
+            registry,
+            stages: self.stages.clone(),
+            metadata: self.metadata.clone(),
+        };
+        self.controller.link_child(child.context());
+        // Link first, then check: cancellation racing the link must not be lost.
+        if self.controller.is_killed() {
+            child.controller.kill();
+        } else if self.controller.is_stopped() {
+            child.controller.stop();
+        }
+        Some(child)
+    }
+
     // Create a new context with initial data
     pub fn new(current: T) -> Self {
         Context {
@@ -436,6 +458,9 @@ impl AsyncEngineContext for Controller {
     }
 
     fn stop_generating(&self) {
+        // Publish before taking the child snapshot so a concurrently linked attempt can
+        // observe cancellation even when it was absent from that snapshot.
+        let _ = self.tx.send(State::Stopped);
         // Clone child Arcs to avoid deadlock if parent is accidentally linked under child
         let children = self
             .child_context
@@ -447,11 +472,10 @@ impl AsyncEngineContext for Controller {
         for child in children {
             child.stop_generating();
         }
-
-        let _ = self.tx.send(State::Stopped);
     }
 
     fn stop(&self) {
+        let _ = self.tx.send(State::Stopped);
         // Clone child Arcs to avoid deadlock if parent is accidentally linked under child
         let children = self
             .child_context
@@ -463,11 +487,10 @@ impl AsyncEngineContext for Controller {
         for child in children {
             child.stop();
         }
-
-        let _ = self.tx.send(State::Stopped);
     }
 
     fn kill(&self) {
+        let _ = self.tx.send(State::Killed);
         // Clone child Arcs to avoid deadlock if parent is accidentally linked under child
         let children = self
             .child_context
@@ -479,8 +502,6 @@ impl AsyncEngineContext for Controller {
         for child in children {
             child.kill();
         }
-
-        let _ = self.tx.send(State::Killed);
     }
 
     fn link_child(&self, child: Arc<dyn AsyncEngineContext>) {
@@ -501,6 +522,52 @@ impl AsyncEngineContext for Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_attempt_preserves_context_without_consuming_unique_values() {
+        let mut parent = Context::with_id_and_metadata(
+            (),
+            "request".into(),
+            BTreeMap::from([("tenant".into(), "tenant-a".into())]),
+        );
+        parent.insert("shared", 42_u32);
+        let attempt = parent.fork_shared("attempt").unwrap();
+        assert_eq!(attempt.id(), parent.id());
+        assert_eq!(attempt.metadata(), parent.metadata());
+        assert_eq!(*attempt.get::<u32>("shared").unwrap(), 42);
+        attempt.context().stop();
+        assert!(!parent.context().is_stopped());
+        let retry = parent.fork_shared("retry").unwrap();
+        parent.context().kill();
+        assert!(retry.context().is_killed());
+        assert!(parent.fork_shared("late").unwrap().context().is_killed());
+
+        let mut unique = Context::new(());
+        unique.insert_unique("owned", 7_u32);
+        assert!(unique.fork_shared(()).is_none());
+        assert_eq!(unique.take_unique::<u32>("owned").unwrap(), 7);
+    }
+
+    #[test]
+    fn cancellation_is_visible_before_the_child_snapshot() {
+        let parent = Arc::new(Controller::default());
+        // Hold the snapshot lock while cancellation starts. A new child cannot rely on having
+        // appeared in that snapshot; fork_shared must already be able to see the parent state.
+        let children = parent.child_context.lock().unwrap();
+        let canceller = parent.clone();
+        let thread = std::thread::spawn(move || canceller.kill());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !parent.is_killed() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let visible = parent.is_killed();
+        drop(children);
+        thread.join().unwrap();
+        assert!(
+            visible,
+            "cancellation was published only after taking the child snapshot"
+        );
+    }
 
     #[derive(Debug, Clone)]
     struct Input {

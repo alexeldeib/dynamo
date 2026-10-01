@@ -3579,64 +3579,36 @@ async fn chat_completions(
             )
             .or_else(|| chat_affinity_key(None, &body.inner.messages))
         });
-    let (engine, parsing_options) = worker_set_selection::with_affinity(affinity, || {
-        state
-            .manager()
-            .get_chat_completions_engine_with_parsing(&model)
-    })
-    .map_err(|e| {
-        let err_response = ErrorMessage::from_model_error(&e);
-        inflight_guard.mark_error(extract_error_type_from_response(&err_response));
-        err_response
-    })?;
-
-    // Request policy controls whether parser-produced tool calls may be exposed.
-    // Assistant response/guided constraints are handled separately during
-    // preprocessing and do not revoke an auto request's tool-call permission.
-    let parsing_options = apply_request_tool_call_parsing_options(parsing_options, &request)
-        .map_err(|e| {
-            let err_response = ErrorMessage::from_anyhow(e.into(), "Invalid tool_choice");
-            inflight_guard.mark_error(extract_error_type_from_response(&err_response));
-            err_response
-        })?;
-
-    // When parallel_tool_calls is false, limit the response to a single tool call.
-    let parsing_options =
-        parsing_options.with_parallel_tool_calls(request.inner.parallel_tool_calls);
+    let annotations = request.annotations();
     let enforce_single_tool_call = request.inner.parallel_tool_calls == Some(false);
-
-    // Any force_nonempty_content=true request: surface reasoning as content when
-    // the turn produced none. See `wants_reasoning_as_content_when_empty`.
-    let move_reasoning_to_content_when_empty =
-        crate::preprocessor::OpenAIPreprocessor::wants_reasoning_as_content_when_empty(
-            request.chat_template_args.as_ref(),
-        );
-    let parsing_options = parsing_options
-        .with_move_reasoning_to_content_when_empty(move_reasoning_to_content_when_empty);
-
-    // Computed before `request` moves into `generate`. Only a stream that can
-    // withhold every data frame needs forced keep-alive frames.
-    let stream_can_defer_all_output =
-        request_stream_can_defer_all_output(&parsing_options, request.chat_template_args.as_ref());
-
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
 
-    let annotations = request.annotations();
-
-    // issue the generate call on the engine
-    let stream = engine.generate(request).await.map_err(|e| {
-        if super::metrics::request_was_rejected(e.as_ref()) {
-            state
-                .metrics_clone()
-                .inc_rejection(&model, super::metrics::Endpoint::ChatCompletions);
-        }
-        let err_response = ErrorMessage::from_anyhow(e, "Failed to generate completions");
-        inflight_guard.mark_error(extract_error_type_from_response(&err_response));
-        err_response
-    })?;
-
+    let (stream, parsing_options, stream_can_defer_all_output) =
+        super::worker_set_failover::generate_chat(request, affinity, || {
+            state.manager().get_chat_engine_selection(&model)
+        })
+        .await
+        .map_err(|error| {
+            use super::worker_set_failover::DispatchError;
+            let response = match error {
+                DispatchError::Selection(error) => ErrorMessage::from_model_error(&error),
+                DispatchError::Policy(error) => {
+                    ErrorMessage::from_anyhow(error, "Invalid tool_choice")
+                }
+                DispatchError::Generate(error) => {
+                    if super::metrics::request_was_rejected(error.as_ref()) {
+                        state
+                            .metrics_clone()
+                            .inc_rejection(&model, Endpoint::ChatCompletions);
+                    }
+                    ErrorMessage::from_anyhow(error, "Failed to generate completions")
+                }
+            };
+            inflight_guard.mark_error(extract_error_type_from_response(&response));
+            response
+        })?;
     // capture the context to cancel the stream if the client disconnects
     let ctx = stream.context();
 

@@ -40,6 +40,13 @@ pub struct Registry {
 }
 
 impl Registry {
+    pub(super) fn clone_shared_only(&self) -> Option<Self> {
+        self.unique_storage.is_empty().then(|| Self {
+            shared_storage: self.shared_storage.clone(),
+            unique_storage: HashMap::new(),
+        })
+    }
+
     /// Create a new empty registry.
     pub fn new() -> Self {
         Registry {

@@ -1502,6 +1502,18 @@ impl ModelManager {
 
     // -- Combined engine + parsing options (atomically from one WorkerSet) --
 
+    pub(crate) fn get_chat_engine_selection(
+        &self,
+        model: &str,
+    ) -> Result<super::ChatEngineSelection, ModelManagerError> {
+        self.catalog
+            .load()
+            .models
+            .get(model)
+            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
+            .get_chat_engine_selection()
+    }
+
     pub fn get_chat_completions_engine_with_parsing(
         &self,
         model: &str,

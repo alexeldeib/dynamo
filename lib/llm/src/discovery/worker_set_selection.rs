@@ -97,6 +97,22 @@ pub struct WorkerSetAffinity {
 
 tokio::task_local! {
     static REQUEST_AFFINITY: WorkerSetAffinity;
+    static EXCLUDED_NAMESPACE: String;
+}
+
+/// A failed revision must not be selected again while discovery converges. This exclusion is
+/// request-local and never withdraws a revision for other requests.
+pub(crate) fn excluding_namespace<R>(namespace: Option<&str>, f: impl FnOnce() -> R) -> R {
+    match namespace {
+        Some(namespace) => EXCLUDED_NAMESPACE.sync_scope(namespace.to_owned(), f),
+        None => f(),
+    }
+}
+
+pub(crate) fn namespace_is_excluded(namespace: &str) -> bool {
+    EXCLUDED_NAMESPACE
+        .try_with(|excluded| excluded == namespace)
+        .unwrap_or(false)
 }
 
 /// Affinity for `request` from its gateway pin and session id, falling back to `body_key`. `None` when
